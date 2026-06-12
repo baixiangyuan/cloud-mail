@@ -8,7 +8,7 @@ import accountService from './account-service';
 import BizError from '../error/biz-error';
 import emailUtils from '../utils/email-utils';
 import fileUtils from '../utils/file-utils';
-// 移除Resend导入：import { Resend } from 'resend';
+import { Resend } from 'resend';
 import attService from './att-service';
 import { parseHTML } from 'linkedom';
 import userService from './user-service';
@@ -230,11 +230,11 @@ const emailService = {
 		}
 
 		const domain = emailUtils.getDomain(accountRow.email);
-		const brevoApiKey = resendTokens[domain]; // 复用原有resendTokens配置项，存放Brevo API Key
+		const resendToken = resendTokens[domain];
 		const useCloudflareEmail = !!c.env.email;
 
 		//如果接收方存在站外邮箱，又没有发信服务
-		if (!useCloudflareEmail && !brevoApiKey && !allInternal) {
+		if (!useCloudflareEmail && !resendToken && !allInternal) {
 			throw new BizError(t('noSendProvider'));
 		}
 
@@ -260,7 +260,7 @@ const emailService = {
 
 		let sendResult = {};
 
-		//存在站外邮箱时，如果配置了 Cloudflare Email Service 就优先使用，否则使用 Brevo
+		//存在站外邮箱时，如果配置了 Cloudflare Email Service 就优先使用，否则使用 Resend
 		if (!allInternal) {
 
 			if (useCloudflareEmail) {
@@ -276,7 +276,7 @@ const emailService = {
 					messageId: emailRow.messageId
 				});
 			} else {
-				sendResult = await this.sendByResend(brevoApiKey, {
+				sendResult = await this.sendByResend(resendToken, {
 					name,
 					accountEmail: accountRow.email,
 					receiveEmail,
@@ -411,49 +411,26 @@ const emailService = {
 		};
 	},
 
-	// 重写为Brevo API发信，函数名保留sendByResend兼容原有调用逻辑
-	async sendByResend(brevoApiKey, params) {
+	async sendByResend(resendToken, params) {
+		const resend = new Resend(resendToken);
+
 		const sendForm = {
-			sender: { name: params.name, email: params.accountEmail },
-			to: params.receiveEmail.map(e => ({ email: e })),
+			from: `${params.name} <${params.accountEmail}>`,
+			to: [...params.receiveEmail],
 			subject: params.subject,
-			htmlContent: params.html,
-			textContent: params.text
+			text: params.text,
+			html: params.html,
+			attachments: await this.toResendAttachments(params.attachments)
 		};
 
-		// 回复邮件头处理
-		if (params.sendType === 'reply' && params.messageId) {
+		if (params.sendType === 'reply') {
 			sendForm.headers = {
 				'in-reply-to': params.messageId,
 				'references': params.messageId
 			};
 		}
 
-		// 处理附件
-		const attachments = await this.toResendAttachments(params.attachments);
-		if (attachments.length) {
-			sendForm.attachment = attachments.map(item => ({
-				name: item.filename,
-				content: item.content,
-				contentType: item.contentType || 'application/octet-stream'
-			}));
-		}
-
-		// 请求Brevo官方API
-		const res = await fetch('https://api.brevo.com/v3/smtp/email', {
-			method: 'POST',
-			headers: {
-				'api-key': brevoApiKey,
-				'Content-Type': 'application/json'
-			},
-			body: JSON.stringify(sendForm)
-		});
-
-		const data = await res.json();
-		if (!res.ok) {
-			return { error: new Error(data.message || 'Brevo邮件发送失败') };
-		}
-		return { data: { id: data.messageId } };
+		return await resend.emails.send(sendForm);
 	},
 
 	async toCloudflareAttachments(attachments) {
@@ -810,8 +787,3 @@ const emailService = {
 			if (timeSort) {
 				emailId = 0;
 			}
-		}
-	}
-};
-
-export default emailService;
