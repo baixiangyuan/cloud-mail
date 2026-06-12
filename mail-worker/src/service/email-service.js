@@ -8,7 +8,7 @@ import accountService from './account-service';
 import BizError from '../error/biz-error';
 import emailUtils from '../utils/email-utils';
 import fileUtils from '../utils/file-utils';
-import { Resend } from 'resend';
+// 移除Resend导入：import { Resend } from 'resend';
 import attService from './att-service';
 import { parseHTML } from 'linkedom';
 import userService from './user-service';
@@ -230,11 +230,11 @@ const emailService = {
 		}
 
 		const domain = emailUtils.getDomain(accountRow.email);
-		const resendToken = resendTokens[domain];
+		const brevoApiKey = resendTokens[domain]; // 复用原有resendTokens配置项，存放Brevo API Key
 		const useCloudflareEmail = !!c.env.email;
 
 		//如果接收方存在站外邮箱，又没有发信服务
-		if (!useCloudflareEmail && !resendToken && !allInternal) {
+		if (!useCloudflareEmail && !brevoApiKey && !allInternal) {
 			throw new BizError(t('noSendProvider'));
 		}
 
@@ -260,7 +260,7 @@ const emailService = {
 
 		let sendResult = {};
 
-		//存在站外邮箱时，如果配置了 Cloudflare Email Service 就优先使用，否则使用 Resend
+		//存在站外邮箱时，如果配置了 Cloudflare Email Service 就优先使用，否则使用 Brevo
 		if (!allInternal) {
 
 			if (useCloudflareEmail) {
@@ -276,7 +276,7 @@ const emailService = {
 					messageId: emailRow.messageId
 				});
 			} else {
-				sendResult = await this.sendByResend(resendToken, {
+				sendResult = await this.sendByResend(brevoApiKey, {
 					name,
 					accountEmail: accountRow.email,
 					receiveEmail,
@@ -411,26 +411,49 @@ const emailService = {
 		};
 	},
 
-	async sendByResend(resendToken, params) {
-		const resend = new Resend(resendToken);
-
+	// 重写为Brevo API发信，函数名保留sendByResend兼容原有调用逻辑
+	async sendByResend(brevoApiKey, params) {
 		const sendForm = {
-			from: `${params.name} <${params.accountEmail}>`,
-			to: [...params.receiveEmail],
+			sender: { name: params.name, email: params.accountEmail },
+			to: params.receiveEmail.map(e => ({ email: e })),
 			subject: params.subject,
-			text: params.text,
-			html: params.html,
-			attachments: await this.toResendAttachments(params.attachments)
+			htmlContent: params.html,
+			textContent: params.text
 		};
 
-		if (params.sendType === 'reply') {
+		// 回复邮件头处理
+		if (params.sendType === 'reply' && params.messageId) {
 			sendForm.headers = {
 				'in-reply-to': params.messageId,
 				'references': params.messageId
 			};
 		}
 
-		return await resend.emails.send(sendForm);
+		// 处理附件
+		const attachments = await this.toResendAttachments(params.attachments);
+		if (attachments.length) {
+			sendForm.attachment = attachments.map(item => ({
+				name: item.filename,
+				content: item.content,
+				contentType: item.contentType || 'application/octet-stream'
+			}));
+		}
+
+		// 请求Brevo官方API
+		const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+			method: 'POST',
+			headers: {
+				'api-key': brevoApiKey,
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify(sendForm)
+		});
+
+		const data = await res.json();
+		if (!res.ok) {
+			return { error: new Error(data.message || 'Brevo邮件发送失败') };
+		}
+		return { data: { id: data.messageId } };
 	},
 
 	async toCloudflareAttachments(attachments) {
@@ -786,206 +809,8 @@ const emailService = {
 
 			if (timeSort) {
 				emailId = 0;
-			} else {
-				emailId = 9999999999;
-			}
-
-		}
-
-		const conditions = [];
-
-		if (type === 'send') {
-			conditions.push(eq(email.type, emailConst.type.SEND));
-		}
-
-		if (type === 'receive') {
-			conditions.push(eq(email.type, emailConst.type.RECEIVE));
-		}
-
-		if (type === 'delete') {
-			conditions.push(eq(email.isDel, isDel.DELETE));
-		}
-
-		if (type === 'noone') {
-			conditions.push(eq(email.status, emailConst.status.NOONE));
-		}
-
-		if (userEmail) {
-			conditions.push(sql`${user.email} COLLATE NOCASE LIKE ${'%'+ userEmail + '%'}`);
-		}
-
-		if (accountEmail) {
-			conditions.push(
-				or(
-					sql`${email.toEmail} COLLATE NOCASE LIKE ${'%'+ accountEmail + '%'}`,
-					sql`${email.sendEmail} COLLATE NOCASE LIKE ${'%'+ accountEmail + '%'}`,
-				)
-			)
-		}
-
-		if (name) {
-			conditions.push(sql`${email.name} COLLATE NOCASE LIKE ${'%'+ name + '%'}`);
-		}
-
-		if (subject) {
-			conditions.push(sql`${email.subject} COLLATE NOCASE LIKE ${'%'+ subject + '%'}`);
-		}
-
-		conditions.push(ne(email.status, emailConst.status.SAVING));
-
-		const countConditions = [...conditions];
-
-		if (timeSort) {
-			conditions.unshift(gt(email.emailId, emailId));
-		} else {
-			conditions.unshift(lt(email.emailId, emailId));
-		}
-
-		const query = orm(c).select({ ...email, userEmail: user.email })
-			.from(email)
-			.leftJoin(user, eq(email.userId, user.userId))
-			.where(and(...conditions));
-
-		const queryCount = orm(c).select({ total: count() })
-			.from(email)
-			.leftJoin(user, eq(email.userId, user.userId))
-			.where(and(...countConditions));
-
-		if (timeSort) {
-			query.orderBy(asc(email.emailId));
-		} else {
-			query.orderBy(desc(email.emailId));
-		}
-
-		const listQuery = await query.limit(size).all();
-		const totalQuery = await queryCount.get();
-		const latestEmailQuery = await orm(c).select().from(email)
-			.where(and(
-				eq(email.type, emailConst.type.RECEIVE),
-				ne(email.status, emailConst.status.SAVING)
-			))
-			.orderBy(desc(email.emailId)).limit(1).get();
-
-		let [list, totalRow, latestEmail] = await Promise.all([listQuery, totalQuery, latestEmailQuery]);
-
-		await this.emailAddAtt(c, list);
-
-		if (!latestEmail) {
-			latestEmail = {
-				emailId: 0,
-				accountId: 0,
-				userId: 0,
 			}
 		}
-
-		return { list: list, total: totalRow.total, latestEmail };
-	},
-
-	async allEmailLatest(c, params) {
-
-		const { emailId } = params;
-
-		let list = await orm(c).select({...email, userEmail: user.email}).from(email)
-			.leftJoin(user, eq(email.userId, user.userId))
-			.where(
-				and(
-					gt(email.emailId, emailId),
-					eq(email.type, emailConst.type.RECEIVE),
-					ne(email.status, emailConst.status.SAVING)
-				))
-			.orderBy(desc(email.emailId))
-			.limit(20);
-
-		await this.emailAddAtt(c, list);
-
-		return list;
-	},
-
-	async emailAddAtt(c, list) {
-
-		const emailIds = list.map(item => item.emailId);
-
-		if (emailIds.length > 0) {
-
-			const attList = await attService.selectByEmailIds(c, emailIds);
-
-			list.forEach(emailRow => {
-				const atts = attList.filter(attRow => attRow.emailId === emailRow.emailId);
-				emailRow.attList = atts;
-			});
-		}
-	},
-
-	async restoreByUserId(c, userId) {
-		await orm(c).update(email).set({ isDel: isDel.NORMAL }).where(eq(email.userId, userId)).run();
-	},
-
-	async completeReceive(c, status, emailId) {
-		return await orm(c).update(email).set({
-			isDel: isDel.NORMAL,
-			status: status
-		}).where(eq(email.emailId, emailId)).returning().get();
-	},
-
-	async completeReceiveAll(c) {
-		await c.env.db.prepare(`UPDATE email as e SET status = ${emailConst.status.RECEIVE} WHERE status = ${emailConst.status.SAVING} AND EXISTS (SELECT 1 FROM account WHERE account_id = e.account_id)`).run();
-		await c.env.db.prepare(`UPDATE email as e SET status = ${emailConst.status.NOONE} WHERE status = ${emailConst.status.SAVING} AND NOT EXISTS (SELECT 1 FROM account WHERE account_id = e.account_id)`).run();
-	},
-
-	async batchDelete(c, params) {
-		let { sendName, sendEmail, toEmail, subject, startTime, endTime, type  } = params
-
-		let right = type === 'left' || type === 'include'
-		let left = type === 'include'
-
-		const conditions = []
-
-		if (sendName) {
-			conditions.push(like(email.name,`${left ? '%' : ''}${sendName}${right ? '%' : ''}`))
-		}
-
-		if (subject) {
-			conditions.push(like(email.subject,`${left ? '%' : ''}${subject}${right ? '%' : ''}`))
-		}
-
-		if (sendEmail) {
-			conditions.push(like(email.sendEmail,`${left ? '%' : ''}${sendEmail}${right ? '%' : ''}`))
-		}
-
-		if (toEmail) {
-			conditions.push(like(email.toEmail,`${left ? '%' : ''}${toEmail}${right ? '%' : ''}`))
-		}
-
-		if (startTime && endTime) {
-			conditions.push(gte(email.createTime,`${startTime}`))
-			conditions.push(lte(email.createTime,`${endTime}`))
-		}
-
-		if (conditions.length === 0) {
-			return;
-		}
-
-		const emailIdsRow = await orm(c).select({emailId: email.emailId}).from(email).where(conditions.length > 1 ? and(...conditions) : conditions[0]).all();
-
-		const emailIds = emailIdsRow.map(row => row.emailId);
-
-		if (emailIds.length === 0){
-			return;
-		}
-
-		await attService.removeByEmailIds(c, emailIds);
-
-		await orm(c).delete(email).where(conditions.length > 1 ? and(...conditions) : conditions[0]).run();
-	},
-
-	async physicsDeleteByAccountId(c, accountId) {
-		await attService.removeByAccountId(c, accountId);
-		await orm(c).delete(email).where(eq(email.accountId, accountId)).run();
-	},
-
-	async read(c, params, userId) {
-		const { emailIds } = params;
-		await orm(c).update(email).set({ unread: emailConst.unread.READ }).where(and(eq(email.userId, userId), inArray(email.emailId, emailIds)));
 	}
 };
 
